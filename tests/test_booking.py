@@ -416,7 +416,11 @@ def test_a_call_is_logged_with_whoever_registered_during_it(db):
         booking = call(
             db,
             "select vetvoice.book_appointment(%s, %s, %s, %s, %s)",
-            carla["client"]["id"], carla["pets"][0]["id"], VET_A, slot(), "call-1",
+            carla["client"]["id"],
+            carla["pets"][0]["id"],
+            VET_A,
+            slot(),
+            "call-1",
         )
         assert booking["status"] == "booked"
         db.execute("select vetvoice.end_call('call-1', 'booked', '[]', '{}', 0.01)")
