@@ -2,8 +2,8 @@
 
 The app's whole surface on Postgres is the SQL functions in supabase/migrations.
 
-    uv run db.py migrate    apply the migrations to a new database
-    uv run db.py reset      drop the vetvoice schema, migrate again and load the seed
+    uv run --env-file .env db.py migrate    apply the migrations to a new database
+    uv run --env-file .env db.py reset      drop the vetvoice schema, migrate again and load the seed
 """
 
 import os
