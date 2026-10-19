@@ -71,6 +71,11 @@ def test_cost_counts_cached_tokens_and_audio_minutes():
     assert cost_usd(usage) == pytest.approx((2_000 * 0.40 + 8_000 * 0.10 + 500 * 1.60) / 1e6 + 2 * 0.017)
 
 
+def test_live_transcription_is_billed_for_the_whole_session():
+    # gpt-live-transcribe reports no audio duration; it streams, and bills, the whole call.
+    assert cost_usd([{"model": "gpt-live-transcribe"}], session_minutes=4) == pytest.approx(4 * 0.017)
+
+
 def test_a_finished_call_is_saved_with_its_cost():
     """The seam between Python and SQL that log_call crosses. The first real call lost its
     whole report here: a float cost matched no end_call signature."""
@@ -83,7 +88,7 @@ def test_a_finished_call_is_saved_with_its_cost():
                 "chat_history": {"items": [{"type": "message", "role": "user", "content": ["oi"]}]},
                 "usage": [{"model": "gpt-4.1-mini", "input_tokens": 1_000, "output_tokens": 100}],
             }
-            await save_call(call, report)
+            await save_call(call, report, session_minutes=0)
             cur = await db.execute(
                 "select outcome, cost_usd, transcript is not null, ended_at is not null from vetvoice.calls"
                 " where id = %s",

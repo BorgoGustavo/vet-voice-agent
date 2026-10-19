@@ -290,7 +290,9 @@ class VetAgent(Agent):
         return answer({"status": "transferred"})
 
 
-def cost_usd(usage: list[dict]) -> float:
+def cost_usd(usage: list[dict], session_minutes: float = 0.0) -> float:
+    """Model cost of a call. Per-minute models without an audio duration in their usage
+    (live transcription streams the whole call) are billed for the session's length."""
     total = 0.0
     for u in usage:
         price = PRICES.get(u.get("model"))
@@ -302,28 +304,37 @@ def cost_usd(usage: list[dict]) -> float:
             + cached * price.get("cached", 0)
             + u.get("output_tokens", 0) * price.get("output", 0)
         ) / 1e6
-        total += u.get("audio_duration", 0) / 60 * price.get("minute", 0)
+        minutes = u["audio_duration"] / 60 if u.get("audio_duration") else session_minutes
+        total += minutes * price.get("minute", 0)
     return round(total, 5)
 
 
 server = AgentServer()
 
 
-async def save_call(call: Call, report: dict) -> None:
+async def save_call(call: Call, report: dict, session_minutes: float) -> None:
     """Transcript (with per-turn latency), usage and cost of a finished call."""
     usage = report["usage"] or []
     await call.db.execute(
         # A Python float arrives as double precision, which matches no end_call signature.
         "select vetvoice.end_call(%s, %s, %s, %s, %s::numeric)",
-        (call.call_id, call.outcome, Jsonb(report["chat_history"]), Jsonb(usage), cost_usd(usage)),
+        (
+            call.call_id,
+            call.outcome,
+            Jsonb(report["chat_history"]),
+            Jsonb(usage),
+            cost_usd(usage, session_minutes),
+        ),
     )
 
 
 async def log_call(ctx: JobContext) -> None:
     """Runs after the session closes."""
     call: Call = ctx.primary_session.userdata
+    report = ctx.make_session_report()
+    minutes = (report.timestamp - report.started_at) / 60 if report.started_at else 0.0
     try:
-        await save_call(call, ctx.make_session_report().to_dict())
+        await save_call(call, report.to_dict(), minutes)
     finally:
         await call.db.close()
 
