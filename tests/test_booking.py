@@ -23,6 +23,7 @@ ROUNDS = int(os.environ.get("RACE_ROUNDS", "100"))  # crank it up to hunt for ra
 DEADLOCK_STALL = 0.8  # seconds. Postgres waits deadlock_timeout (1 s) before breaking a deadlock.
 
 BOOK = "select vetvoice.book_appointment(%s, %s, %s, %s)"
+BOOK_ANOTHER = "select vetvoice.book_appointment(%s, %s, %s, %s, p_additional => true)"
 RESCHEDULE = "select vetvoice.reschedule_appointment(%s, %s, %s, %s)"
 CANCEL = "select vetvoice.cancel_appointment(%s, %s)"
 FIND = "select vetvoice.find_slots(%s, %s, %s)"
@@ -257,6 +258,26 @@ def test_the_same_request_twelve_times_at_once_books_once(db, callers):
     assert len(booked(db)) == 1
 
 
+def test_a_second_appointment_for_the_same_pet_needs_the_flag(db):
+    monday = call(db, BOOK, ANA, 1, VET_A, slot())["appointment"]
+    tuesday = call(db, BOOK, ANA, 1, VET_A, slot(days=1))  # "Monday... actually Tuesday"
+    assert tuesday["status"] == "pet_already_booked" and tuesday["appointment"] == monday
+    assert call(db, BOOK_ANOTHER, ANA, 1, VET_A, slot(days=1))["status"] == "booked"  # a follow-up visit
+    assert call(db, BOOK, ANA, 1, VET_A, slot(days=1))["status"] == "booked"  # repeating either one is harmless
+    assert len(booked(db)) == 2
+
+
+def test_twelve_bookings_for_one_pet_at_once_book_once(db, callers):
+    """Twelve different times for one pet: without the lock on the pet, each would see no
+    upcoming appointment and they would all go in."""
+    for _ in range(ROUNDS // 5):
+        times = [slot(hour=8 + i // 2, minute=30 * (i % 2)) for i in range(CALLERS)]
+        results, _ = race(callers, [(BOOK, (ANA, 1, VET_A, t)) for t in times])
+        assert Counter(r["status"] for r in results) == {"booked": 1, "pet_already_booked": CALLERS - 1}
+        assert len(booked(db)) == 1
+        db.execute("delete from vetvoice.appointments")
+
+
 def test_same_pet_same_time_other_vet_is_not_a_second_booking(db):
     first = call(db, BOOK, ANA, 1, VET_A, slot())["appointment"]
     other_vet = call(db, BOOK, ANA, 1, VET_B, slot())
@@ -317,13 +338,16 @@ def test_past_appointments_can_be_neither_cancelled_nor_moved(db):
 # --- finding a slot ----------------------------------------------------------------------
 
 
-def test_find_slots_offers_the_first_free_times_one_vet_each(db):
+def test_find_slots_offers_the_first_free_times_from_the_least_busy_vet(db):
+    empty_day = call(db, FIND, slot(hour=0), slot(hour=12), None)
+    assert {s["vet_id"] for s in empty_day} == {VET_A}  # a tie goes to the first vet
     call(db, BOOK, ANA, 1, VET_A, slot(hour=8))
     call(db, BOOK, ANA, 2, VET_B, slot(hour=8))  # 08:00 is full
     call(db, BOOK, ANA, 3, VET_A, slot(hour=8, minute=30))
     found = call(db, FIND, slot(hour=0), slot(hour=12), None)
     assert [s["starts_at"][11:] for s in found] == ["08:30", "09:00", "09:30", "10:00", "10:30", "11:00"]
-    assert [s["vet_id"] for s in found] == [VET_B] + [VET_A] * 5
+    assert [s["vet_id"] for s in found] == [VET_B] * 6  # A has two that day, B one
+    assert {s["weekday"] for s in found} == {"segunda-feira"}
     with_vet_a = call(db, FIND, slot(hour=8), slot(hour=10), VET_A)
     assert [s["starts_at"][11:] for s in with_vet_a] == ["09:00", "09:30"]
 
@@ -339,10 +363,11 @@ def test_find_slots_clamps_an_absurd_window(db):
 def test_a_full_day_still_gets_alternatives(db):
     saturday = slot(hour=8, days=5)
     for i in range(8):  # Saturday is 08:00 to 12:00
-        call(db, BOOK, ANA, 1, VET_A, saturday + timedelta(minutes=30 * i))
-        call(db, BOOK, ANA, 2, VET_B, saturday + timedelta(minutes=30 * i))
+        call(db, BOOK_ANOTHER, ANA, 1, VET_A, saturday + timedelta(minutes=30 * i))
+        call(db, BOOK_ANOTHER, ANA, 2, VET_B, saturday + timedelta(minutes=30 * i))
     taken = call(db, BOOK, BRUNO, THOR, VET_A, saturday)
     assert taken["status"] == "slot_taken" and len(taken["alternatives"]) == 4
+    assert {a["weekday"] for a in taken["alternatives"]} == {"sexta-feira"}  # Sunday is closed
     assert not any(a["starts_at"].startswith(f"{saturday:%Y-%m-%d}") for a in taken["alternatives"])
 
 
@@ -355,7 +380,7 @@ def test_the_agent_knows_the_caller_before_saying_hello(db):
         (VET_A, THOR, slot(days=-28)),
     )
     upcoming = call(db, BOOK, BRUNO, THOR, VET_B, slot(hour=11))["appointment"]
-    call(db, CANCEL, BRUNO, call(db, BOOK, BRUNO, THOR, VET_A, slot(hour=14))["appointment"]["id"])
+    call(db, CANCEL, BRUNO, call(db, BOOK_ANOTHER, BRUNO, THOR, VET_A, slot(hour=14))["appointment"]["id"])
 
     context = call(db, CONTEXT, "+5511900000002")
     assert context["client"] == {"id": BRUNO, "name": "Bruno"}
@@ -378,7 +403,30 @@ def test_a_new_caller_registers_once(db):
         assert first["client"]["name"] == "Carla" and [p["name"] for p in first["pets"]] == ["Bolinha"]
         another = call(db, REGISTER, NEW_CALLER, None, "Nina", "cachorro")  # a known owner needs no name
         assert [p["name"] for p in another["pets"]] == ["Bolinha", "Nina"]
+        heard_lowercase = call(db, REGISTER, NEW_CALLER, None, "bolinha", "gato")
+        assert [p["name"] for p in heard_lowercase["pets"]] == ["Bolinha", "Nina"]
     finally:
+        db.execute("delete from vetvoice.clients where phone_e164 = %s", (NEW_CALLER,))
+
+
+def test_a_call_is_logged_with_whoever_registered_during_it(db):
+    try:
+        assert call(db, "select vetvoice.start_call(%s, %s, %s)", "call-1", NEW_CALLER, "CA1")["client"] is None
+        carla = call(db, REGISTER, NEW_CALLER, "Carla", "Bolinha", "gato")
+        booking = call(
+            db,
+            "select vetvoice.book_appointment(%s, %s, %s, %s, %s)",
+            carla["client"]["id"], carla["pets"][0]["id"], VET_A, slot(), "call-1",
+        )
+        assert booking["status"] == "booked"
+        db.execute("select vetvoice.end_call('call-1', 'booked', '[]', '{}', 0.01)")
+        logged = db.execute(
+            "select c.client_id, c.outcome, c.ended_at is not null, a.call_id"
+            " from vetvoice.calls c join vetvoice.appointments a on a.call_id = c.id"
+        ).fetchone()
+        assert logged == (carla["client"]["id"], "booked", True, "call-1")
+    finally:
+        db.execute("delete from vetvoice.calls")
         db.execute("delete from vetvoice.clients where phone_e164 = %s", (NEW_CALLER,))
 
 

@@ -27,9 +27,11 @@ create table pets (
   id        bigint generated always as identity primary key,
   client_id bigint not null references clients on delete cascade,
   name      text not null,
-  species   text not null,
-  unique (client_id, name)
+  species   text not null
 );
+
+-- Speech to text capitalizes as it likes: "luna" is the same pet as "Luna".
+create unique index pets_client_name on pets (client_id, lower(name));
 
 create table calls (
   id              text primary key,  -- LiveKit room name, one per phone call
@@ -95,6 +97,18 @@ language sql stable as $$
          end
 $$;
 
+-- How every slot reaches the agent. The weekday is spelled out because an LLM working
+-- it out from the date gets it wrong, and the agent says it out loud.
+create function slot_json(p_vet_id int, p_vet text, p_start timestamp) returns jsonb
+language sql stable as $$
+  select jsonb_build_object(
+    'vet_id', p_vet_id,
+    'vet', p_vet,
+    'starts_at', to_char(p_start, 'YYYY-MM-DD"T"HH24:MI'),
+    'weekday', (array['segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira',
+                      'sábado', 'domingo'])[extract(isodow from p_start)::int])
+$$;
+
 -- Free slots starting in [p_from, p_to). The series is clamped to the bookable window
 -- because the bounds come from an LLM: "2000 to 2100" must not generate 3.5M rows.
 create function available_slots(p_from timestamp, p_to timestamp)
@@ -117,8 +131,8 @@ $$;
 -- full day still gets an answer.
 create function nearby_slots(p_start timestamp) returns jsonb
 language sql stable set search_path = vetvoice as $$
-  select coalesce(jsonb_agg(to_jsonb(s)), '[]'::jsonb)
-    from (select f.vet_id, f.vet_name as vet, to_char(f.starts_at, 'YYYY-MM-DD"T"HH24:MI') as starts_at
+  select coalesce(jsonb_agg(slot_json(s.vet_id, s.vet_name, s.starts_at)), '[]'::jsonb)
+    from (select f.*
             from available_slots(p_start - interval '2 days', p_start + interval '2 days') f
            order by abs(extract(epoch from f.starts_at - p_start)), f.vet_id
            limit 4) s
@@ -126,25 +140,28 @@ $$;
 
 -- What the agent searches with: the first six free times in a window. One vet per
 -- time unless the caller asked for one, so the list stays short enough to read aloud.
+-- That one is the vet with fewer appointments that day, or the first vet would get them all.
 create function find_slots(p_from timestamp, p_to timestamp, p_vet_id int default null) returns jsonb
 language sql stable set search_path = vetvoice as $$
-  select coalesce(jsonb_agg(to_jsonb(s) order by s.starts_at), '[]'::jsonb)
-    from (select distinct on (f.starts_at) f.vet_id, f.vet_name as vet,
-                 to_char(f.starts_at, 'YYYY-MM-DD"T"HH24:MI') as starts_at
+  select coalesce(jsonb_agg(slot_json(s.vet_id, s.vet_name, s.starts_at) order by s.starts_at), '[]'::jsonb)
+    from (select distinct on (f.starts_at) f.*
             from available_slots(p_from, p_to) f
            where p_vet_id is null or f.vet_id = p_vet_id
-           order by f.starts_at, f.vet_id
+           order by f.starts_at,
+                    (select count(*) from appointments a
+                      where a.vet_id = f.vet_id and a.status = 'booked'
+                        and a.during && tstzrange(date_trunc('day', f.starts_at) at time zone 'America/Sao_Paulo',
+                                                  (date_trunc('day', f.starts_at) + interval '1 day')
+                                                    at time zone 'America/Sao_Paulo')),
+                    f.vet_id
            limit 6) s
 $$;
 
 create function appointment_info(a appointments) returns jsonb
 language sql stable set search_path = vetvoice as $$
-  select jsonb_build_object(
-    'id', a.id,
-    'pet', (select name from pets where id = a.pet_id),
-    'vet_id', a.vet_id,
-    'vet', (select name from vets where id = a.vet_id),
-    'starts_at', to_char(lower(a.during) at time zone 'America/Sao_Paulo', 'YYYY-MM-DD"T"HH24:MI'))
+  select jsonb_build_object('id', a.id, 'pet', (select name from pets where id = a.pet_id))
+         || slot_json(a.vet_id, (select name from vets where id = a.vet_id),
+                      lower(a.during) at time zone 'America/Sao_Paulo')
 $$;
 
 create function appointment_json(p_status text, a appointments) returns jsonb
@@ -153,7 +170,8 @@ language sql stable set search_path = vetvoice as $$
 $$;
 
 create function book_appointment(
-  p_client_id bigint, p_pet_id bigint, p_vet_id int, p_start timestamp, p_call_id text default null)
+  p_client_id bigint, p_pet_id bigint, p_vet_id int, p_start timestamp, p_call_id text default null,
+  p_additional boolean default false)
 returns jsonb language plpgsql set search_path = vetvoice as $$
 declare
   v_during tstzrange := slot_range(p_start);
@@ -163,9 +181,23 @@ begin
   if is_bookable(p_start) is not true then
     return jsonb_build_object('status', 'invalid', 'reason', 'not_bookable');
   end if;
-  if not exists (select 1 from pets where id = p_pet_id and client_id = p_client_id)
-     or not exists (select 1 from vets where id = p_vet_id) then
+  -- Locking the pet queues bookings for the same pet, so the check below has no race.
+  perform 1 from pets where id = p_pet_id and client_id = p_client_id for no key update;
+  if not found or not exists (select 1 from vets where id = p_vet_id) then
     return jsonb_build_object('status', 'invalid', 'reason', 'unknown_pet_or_vet');
+  end if;
+
+  -- A second appointment for the same pet is usually the LLM missing a change of mind
+  -- ("Monday... actually Tuesday"). Say what is already there and let the caller decide.
+  if p_additional is not true then
+    select * into v_appt from appointments
+     where pet_id = p_pet_id and status = 'booked' and lower(during) > now()
+     order by during && v_during desc, during
+     limit 1;
+    if v_appt.id is not null then
+      return appointment_json(case when v_appt.vet_id = p_vet_id and v_appt.during = v_during
+                                   then 'booked' else 'pet_already_booked' end, v_appt);
+    end if;
   end if;
 
   -- No "is it free?" query first: the constraints are the check. With no conflict
@@ -287,9 +319,29 @@ begin
   end if;
 
   insert into pets (client_id, name, species) values (v_client_id, trim(p_pet_name), trim(p_species))
-  on conflict (client_id, name) do nothing;
+  on conflict (client_id, lower(name)) do nothing;
   return jsonb_build_object('status', 'registered') || call_context(p_phone);
 end $$;
+
+-- The call row comes first, so appointments can point at it, and the caller's
+-- context rides back in the same round trip.
+create function start_call(p_call_id text, p_from text, p_twilio_call_sid text default null)
+returns jsonb language plpgsql set search_path = vetvoice as $$
+begin
+  insert into calls (id, from_number, twilio_call_sid, client_id)
+  values (p_call_id, p_from, p_twilio_call_sid, (select id from clients where phone_e164 = p_from))
+  on conflict (id) do nothing;
+  return call_context(p_from);
+end $$;
+
+-- The client is looked up again: a new caller may have registered during the call.
+create function end_call(p_call_id text, p_outcome text, p_transcript jsonb, p_usage jsonb, p_cost_usd numeric)
+returns void language sql set search_path = vetvoice as $$
+  update calls c
+     set ended_at = now(), outcome = p_outcome, transcript = p_transcript, usage = p_usage, cost_usd = p_cost_usd,
+         client_id = (select id from clients where phone_e164 = c.from_number)
+   where c.id = p_call_id
+$$;
 
 -- Supabase serves tables over HTTP with a public key. Nothing here is meant for that:
 -- row level security on with zero policies, so only the owning role (this app) gets in.
