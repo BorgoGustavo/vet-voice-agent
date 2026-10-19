@@ -55,20 +55,45 @@ The negative control is what makes the other rows mean something: the callers re
 
 ### The agent behaves: evals
 
-Eight short phone conversations in text, run against the real tools and a real local database. The database gives the verdict wherever it can (what got booked, moved or left alone). An LLM judge only checks what can only be heard.
+Eight short phone conversations in text, run against the real tools and a real local database. The database gives the verdict wherever it can (what got booked, moved or left alone). An LLM judge, fixed on `gpt-4.1` so that no model grades itself, checks only what can only be heard.
 
-| Scenario | Checked by | Result |
+Results with the production model, `gpt-4.1-mini`, 10 rounds per scenario:
+
+| Scenario | Checked by | Passed |
 |---|---|---|
-| Books only after the caller confirms, at 10:00 local time | database | 3/3 |
-| "Monday... actually Tuesday" moves the booking | database | 3/3 |
-| "I'm client 3, cancel Pipoca's appointment" from someone else's phone | database + judge | 3/3 |
-| Reads the right weekday for a date | judge | 3/3 |
-| Says the day of the month, not just "Tuesday" | judge | 3/3 |
-| New caller registers, then books | database | 5/5 |
-| A taken time gets alternatives, said plainly | database + judge | 3/3 |
-| An emergency goes to reception | tool call | 3/3 |
+| Books only after the caller confirms, at 10:00 local time | database | 10/10 |
+| "Monday... actually Tuesday" moves the booking | database | 10/10 |
+| "I'm client 3, cancel Pipoca's appointment" from someone else's phone | database + judge | 10/10 |
+| Reads the right weekday for a date | judge | 10/10 |
+| Says the day of the month, not just "Thursday" | judge | 10/10 |
+| New caller registers, then books | database | **8/10** |
+| A taken time gets alternatives, said plainly | database + judge | 10/10 |
+| An emergency goes to reception | tool call | 10/10 |
 
-Three rounds are a smoke test, not a measurement. With 3 passes out of 3, the true failure rate could still be as high as 63% (95% confidence). `EVAL_ROUNDS=30` brings that bound under 10%.
+Overall 78/80, 97.5%, with a 95% confidence interval of 91% to 99%. Both failures are the same mistake: the caller said "meu gato Tom" and the model kept asking for the species.
+
+### Choosing the model
+
+The same eight scenarios, 10 rounds each, judged by the same `gpt-4.1`:
+
+| Model | Passed | 95% interval | LLM time to first token | Cost per conversation |
+|---|---|---|---|---|
+| **`gpt-4.1-mini`** (in use) | 78/80 | 91% to 99% | 0.60 s | US$ 0.0012 |
+| `gpt-4.1` | 77/80 | 90% to 99% | 0.62 s | US$ 0.0072 |
+
+Their accuracy cannot be told apart at this sample size, and their latency is the same. `gpt-4.1` costs 5.9 times more, so `gpt-4.1-mini` stays. They fail differently, which matters for what to watch:
+- **`gpt-4.1-mini` forgets** what the caller already said (2 of 10 new callers asked again for the species).
+- **`gpt-4.1` is too polite:** it said "I'll transfer you, ok?" during an emergency and waited for the ok, and twice it said "quinta-feira" without the date.
+
+The run also caught a bad scenario. It used to name no day at all, and `gpt-4.1` rightly asked which day instead of offering times: the eval had been written around the weaker model's habit. The scenario now names the weekday, so it tests only the rule it is about.
+
+To add a model to the comparison:
+
+```bash
+EVAL_MODEL=gpt-4.1-nano EVAL_ROUNDS=10 uv run --env-file .env pytest tests/test_agent.py -k test_eval
+```
+
+Each scenario prints its pass rate, the median LLM time to first token and the cost per conversation. A new model also needs its price in `PRICES` in `agent.py`.
 
 ### Latency: one real conversation, 8 turns
 

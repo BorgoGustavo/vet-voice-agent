@@ -238,9 +238,14 @@ async def dates_are_read_with_the_right_weekday():
 
 
 async def offered_dates_say_the_day_of_the_month():
-    """From the first real call: "terça-feira às 13h" made the caller ask which Tuesday."""
+    """From the first real call: "terça-feira às 13h" made the caller ask which Tuesday.
+
+    The caller names the weekday but not the date, so adding the date is up to the agent.
+    An earlier version named no day at all, and gpt-4.1 rightly asked which day: the
+    scenario was testing a weaker model's habit, not the rule.
+    """
     async with phone_call() as (session, judge, _):
-        result = await session.run(user_input="Quero marcar a Luna com o Dr. Caio, perto da hora do almoço.")
+        result = await session.run(user_input="Quero marcar a Luna com o Dr. Caio na quinta, perto da hora do almoço.")
         await (
             result.expect[-1]
             .is_message(role="assistant")
