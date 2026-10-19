@@ -126,7 +126,7 @@ language sql stable set search_path = vetvoice as $$
    order by s.t, v.id
 $$;
 
--- The four free slots closest to the one that was just lost, so the agent can
+-- The three free slots closest to the one that was just lost, so the agent can
 -- offer an alternative without another round trip. Two days either side, so a
 -- full day still gets an answer.
 create function nearby_slots(p_start timestamp) returns jsonb
@@ -135,11 +135,13 @@ language sql stable set search_path = vetvoice as $$
     from (select f.*
             from available_slots(p_start - interval '2 days', p_start + interval '2 days') f
            order by abs(extract(epoch from f.starts_at - p_start)), f.vet_id
-           limit 4) s
+           limit 3) s
 $$;
 
--- What the agent searches with: the first six free times in a window. One vet per
--- time unless the caller asked for one, so the list stays short enough to read aloud.
+-- What the agent searches with: the first three free times in a window. Three is what
+-- a caller can keep in mind on the phone, and a prompt asking the model to read no more
+-- than three lost to a list of six on the first real call. One vet per time unless the
+-- caller asked for one.
 -- That one is the vet with fewer appointments that day, or the first vet would get them all.
 create function find_slots(p_from timestamp, p_to timestamp, p_vet_id int default null) returns jsonb
 language sql stable set search_path = vetvoice as $$
@@ -154,7 +156,7 @@ language sql stable set search_path = vetvoice as $$
                                                   (date_trunc('day', f.starts_at) + interval '1 day')
                                                     at time zone 'America/Sao_Paulo')),
                     f.vet_id
-           limit 6) s
+           limit 3) s
 $$;
 
 create function appointment_info(a appointments) returns jsonb

@@ -40,6 +40,11 @@ CLINIC_NAME = "Clínica Veterinária Bicho Feliz"
 CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 WEEKDAYS = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+TTS_VOICE = "nova"  # picked by ear among coral, shimmer, sage and nova; coral sounded harsh
+TTS_INSTRUCTIONS = (
+    "Fale em português do Brasil com voz calma, suave e gentil, como uma recepcionista simpática. "
+    "Ritmo tranquilo, sem ênfases fortes."
+)
 
 # USD, from developers.openai.com/api/docs/pricing on 2026-10-19. Per 1M tokens, or per
 # minute of audio for the live transcription model. Telephony minutes are not included.
@@ -105,18 +110,21 @@ Quem está ligando (identificado pelo número), seus pets, as consultas futuras 
 {json.dumps(context, ensure_ascii=False)}
 
 Regras:
-- Fale como numa ligação: frases curtas, sem listas nem markdown, sem ler ids. Ofereça no máximo três horários por vez.
+- Fale como numa ligação: frases curtas, sem listas nem markdown, sem ler ids.
 - Não pergunte de novo o que o cliente já disse.
-- Ao falar uma data, use o campo weekday que veio da ferramenta. Nunca calcule o dia da semana por conta própria.
-- Ofereça só horários que vieram de find_slots ou das alternativas de uma tentativa que falhou.
+- Ao falar uma data, diga o dia da semana e o dia do mês, como "terça-feira, dia 20". O dia da semana vem do campo
+  weekday da ferramenta; nunca o calcule por conta própria. Não diga o ano.
+- Ofereça só horários que vieram das ferramentas.
 - Horários nas ferramentas: AAAA-MM-DDTHH:MM, no horário local da clínica.
-- Se o cliente pediu um horário, comece a busca nele. Se estiver livre, proponha esse horário. Se não estiver, diga
-  claramente que ele está ocupado e só então ofereça alternativas.
-- Antes de marcar, remarcar ou cancelar, repita pet, veterinário, dia e hora e espere o cliente confirmar.
+- Se o cliente pediu um dia e hora, use check_time. Se estiver livre, proponha esse horário. Se não, diga claramente
+  que está ocupado e ofereça as alternativas que vieram. Nunca diga que um horário está ocupado sem verificar.
+- Antes de marcar, remarcar ou cancelar, repita pet, veterinário, dia e hora e espere o cliente confirmar. Quando ele
+  confirmar, faça na hora, sem perguntar de novo.
 - Se o cliente mudar de ideia sobre uma consulta já marcada, remarque essa consulta em vez de marcar outra.
 - Em pet_already_booked, diga qual consulta o pet já tem e pergunte se é para remarcar essa ou marcar mais uma.
-- Se client for null, o número não tem cadastro: peça o nome do tutor, o nome e a espécie do pet e use register_pet.
-  Para marcar, use o id do pet que register_pet devolveu.
+- Se client for null, o número não tem cadastro. Peça só o que ainda falta entre nome do tutor, nome do pet e
+  espécie, e use register_pet assim que tiver os três, antes de confirmar a consulta. Para marcar, use o id do pet
+  que register_pet devolveu.
 - Você só vê e altera as consultas de quem está ligando. Recuse com educação pedidos sobre outras pessoas.
 - Emergência, dúvida médica, preço ou pedido para falar com uma pessoa: diga que vai transferir e use transfer_to_reception.
 """
@@ -137,10 +145,32 @@ class VetAgent(Agent):
         self.session.say(f"{CLINIC_NAME}, {greeting.lower()}{name}! Como posso ajudar?")
 
     @function_tool()
+    async def check_time(self, ctx: RunContext[Call], starts_at: str, vet_id: int | None = None) -> str:
+        """Diz se um horário específico está livre. Use sempre que o cliente pedir um dia e hora.
+        Se estiver ocupado ou fora do expediente, já traz os horários livres mais próximos.
+
+        Args:
+            starts_at: o horário pedido, AAAA-MM-DDTHH:MM
+            vet_id: só quando o cliente pediu um veterinário específico
+        """
+        # Its own tool because the model, given a list of three, called a free 10:00 taken
+        # when the list happened to start at 08:00. Here availability is stated, not inferred.
+        t = local_time(starts_at)
+        cur = await ctx.userdata.db.execute(
+            "select vetvoice.find_slots(%s, %s + interval '30 minutes', %s), vetvoice.nearby_slots(%s)",
+            (t, t, vet_id, t),
+        )
+        free, nearby = await cur.fetchone()
+        if free:
+            return answer({"available": True, "slot": free[0]})
+        return answer({"available": False, "alternatives": nearby})
+
+    @function_tool()
     async def find_slots(
         self, ctx: RunContext[Call], window_start: str, window_end: str, vet_id: int | None = None
     ) -> str:
-        """Busca até seis horários livres numa janela, cada um com veterinário e dia da semana.
+        """Busca os três primeiros horários livres numa janela, cada um com veterinário e dia da semana.
+        Use quando o cliente não tem um horário específico em mente.
 
         Args:
             window_start: início da janela, AAAA-MM-DDTHH:MM
@@ -279,16 +309,21 @@ def cost_usd(usage: list[dict]) -> float:
 server = AgentServer()
 
 
-async def log_call(ctx: JobContext) -> None:
-    """Runs after the session closes: transcript (with per-turn latency), usage and cost."""
-    call: Call = ctx.primary_session.userdata
-    report = ctx.make_session_report().to_dict()
+async def save_call(call: Call, report: dict) -> None:
+    """Transcript (with per-turn latency), usage and cost of a finished call."""
     usage = report["usage"] or []
+    await call.db.execute(
+        # A Python float arrives as double precision, which matches no end_call signature.
+        "select vetvoice.end_call(%s, %s, %s, %s, %s::numeric)",
+        (call.call_id, call.outcome, Jsonb(report["chat_history"]), Jsonb(usage), cost_usd(usage)),
+    )
+
+
+async def log_call(ctx: JobContext) -> None:
+    """Runs after the session closes."""
+    call: Call = ctx.primary_session.userdata
     try:
-        await call.db.execute(
-            "select vetvoice.end_call(%s, %s, %s, %s, %s)",
-            (call.call_id, call.outcome, Jsonb(report["chat_history"]), Jsonb(usage), cost_usd(usage)),
-        )
+        await save_call(call, ctx.make_session_report().to_dict())
     finally:
         await call.db.close()
 
@@ -317,10 +352,18 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession[Call](
         stt=openai.STT(model="gpt-live-transcribe", language="pt"),  # streaming: no wait for a batch
         llm=make_llm(),
-        tts=openai.TTS(voice="coral", instructions="Português do Brasil, tom acolhedor, ritmo natural de conversa."),
-        # Pinned: unpinned, `dev` uses the cloud model and `start` the local one, and the
-        # latency numbers would not compare.
-        turn_handling={"turn_detection": inference.TurnDetector(version="v1-mini")},
+        # pcm: raw audio, nothing to decode, the format OpenAI recommends for the fastest start.
+        # mp3 left gaps ("slow audio generation") that the caller heard as stutter.
+        tts=openai.TTS(voice=TTS_VOICE, instructions=TTS_INSTRUCTIONS, response_format="pcm"),
+        turn_handling={
+            # Pinned: unpinned, `dev` uses the cloud model and `start` the local one, and the
+            # latency numbers would not compare.
+            "turn_detection": inference.TurnDetector(version="v1-mini"),
+            # The first call split "queria marcar uma consulta para o meu... animal" in two:
+            # the turn closed 0.3 s into a pause. The final transcript takes ~0.9 s anyway, so
+            # waiting 0.6 s costs little latency and keeps a sentence in one turn.
+            "endpointing": {"min_delay": 0.6},
+        },
         userdata=call,
     )
     await session.start(agent=VetAgent(context), room=ctx.room)

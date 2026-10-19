@@ -345,8 +345,8 @@ def test_find_slots_offers_the_first_free_times_from_the_least_busy_vet(db):
     call(db, BOOK, ANA, 2, VET_B, slot(hour=8))  # 08:00 is full
     call(db, BOOK, ANA, 3, VET_A, slot(hour=8, minute=30))
     found = call(db, FIND, slot(hour=0), slot(hour=12), None)
-    assert [s["starts_at"][11:] for s in found] == ["08:30", "09:00", "09:30", "10:00", "10:30", "11:00"]
-    assert [s["vet_id"] for s in found] == [VET_B] * 6  # A has two that day, B one
+    assert [s["starts_at"][11:] for s in found] == ["08:30", "09:00", "09:30"]  # three: what a caller can hold in mind
+    assert [s["vet_id"] for s in found] == [VET_B] * 3  # A has two that day, B one
     assert {s["weekday"] for s in found} == {"segunda-feira"}
     with_vet_a = call(db, FIND, slot(hour=8), slot(hour=10), VET_A)
     assert [s["starts_at"][11:] for s in with_vet_a] == ["09:00", "09:30"]
@@ -357,7 +357,7 @@ def test_find_slots_clamps_an_absurd_window(db):
     found = call(db, FIND, datetime(2000, 1, 1), datetime(2100, 1, 1), None)
     assert time.perf_counter() - started < 0.1  # unclamped it takes ~650 ms
     now = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%dT%H:%M")
-    assert len(found) == 6 and found[0]["starts_at"] > now
+    assert len(found) == 3 and found[0]["starts_at"] > now
 
 
 def test_a_full_day_still_gets_alternatives(db):
@@ -366,7 +366,7 @@ def test_a_full_day_still_gets_alternatives(db):
         call(db, BOOK_ANOTHER, ANA, 1, VET_A, saturday + timedelta(minutes=30 * i))
         call(db, BOOK_ANOTHER, ANA, 2, VET_B, saturday + timedelta(minutes=30 * i))
     taken = call(db, BOOK, BRUNO, THOR, VET_A, saturday)
-    assert taken["status"] == "slot_taken" and len(taken["alternatives"]) == 4
+    assert taken["status"] == "slot_taken" and len(taken["alternatives"]) == 3
     assert {a["weekday"] for a in taken["alternatives"]} == {"sexta-feira"}  # Sunday is closed
     assert not any(a["starts_at"].startswith(f"{saturday:%Y-%m-%d}") for a in taken["alternatives"])
 

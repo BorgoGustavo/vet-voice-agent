@@ -19,7 +19,7 @@ import pytest
 from livekit.agents import AgentSession, ToolError, llm, mock_tools
 from test_booking import DSN, slot
 
-from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, make_llm, query
+from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, make_llm, query, save_call
 from db import reset
 
 MODEL = os.environ.get("EVAL_MODEL", LLM_MODEL)
@@ -69,6 +69,30 @@ def test_cost_counts_cached_tokens_and_audio_minutes():
         {"model": "silero", "total_requests": 40},
     ]
     assert cost_usd(usage) == pytest.approx((2_000 * 0.40 + 8_000 * 0.10 + 500 * 1.60) / 1e6 + 2 * 0.017)
+
+
+def test_a_finished_call_is_saved_with_its_cost():
+    """The seam between Python and SQL that log_call crosses. The first real call lost its
+    whole report here: a float cost matched no end_call signature."""
+
+    async def finish_a_call():
+        async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as db:
+            call = Call(db, MARINA, client_id=1, call_id="call-saved", outcome="booked")
+            await query(call, "select vetvoice.start_call(%s, %s, %s)", call.call_id, call.phone, None)
+            report = {
+                "chat_history": {"items": [{"type": "message", "role": "user", "content": ["oi"]}]},
+                "usage": [{"model": "gpt-4.1-mini", "input_tokens": 1_000, "output_tokens": 100}],
+            }
+            await save_call(call, report)
+            cur = await db.execute(
+                "select outcome, cost_usd, transcript is not null, ended_at is not null from vetvoice.calls"
+                " where id = %s",
+                (call.call_id,),
+            )
+            return await cur.fetchone()
+
+    outcome, cost, has_transcript, ended = asyncio.run(finish_a_call())
+    assert (outcome, float(cost), has_transcript, ended) == ("booked", 0.00056, True, True)
 
 
 # --- conversations ---------------------------------------------------------------------
@@ -186,6 +210,21 @@ async def dates_are_read_with_the_right_weekday():
         )
 
 
+async def offered_dates_say_the_day_of_the_month():
+    """From the first real call: "terça-feira às 13h" made the caller ask which Tuesday."""
+    async with phone_call() as (session, model, _):
+        result = await session.run(user_input="Quero marcar a Luna com o Dr. Caio, perto da hora do almoço.")
+        await (
+            result.expect[-1]
+            .is_message(role="assistant")
+            .judge(
+                model,
+                intent="Offers times, and every day it mentions has both the day of the week and the day of the "
+                "month (like 'terça-feira, dia 20'). It does not say the year.",
+            )
+        )
+
+
 async def a_new_caller_registers_then_books():
     monday = slot(hour=10)
 
@@ -240,6 +279,7 @@ SCENARIOS = [
     a_change_of_mind_moves_the_appointment,
     someone_elses_appointment_stays_put,
     dates_are_read_with_the_right_weekday,
+    offered_dates_say_the_day_of_the_month,
     a_new_caller_registers_then_books,
     a_taken_time_gets_alternatives,
     an_emergency_goes_to_reception,
