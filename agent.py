@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -40,6 +42,7 @@ CLINIC_NAME = "Clínica Veterinária Bicho Feliz"
 CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 WEEKDAYS = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+RECORDINGS = Path(os.environ.get("RECORDINGS_DIR", "recordings"))  # both voices of each call; personal data, not in git
 TTS_VOICE = "nova"  # picked by ear among coral, shimmer, sage and nova; coral sounded harsh
 TTS_INSTRUCTIONS = (
     "Fale em português do Brasil com voz calma, suave e gentil, como uma recepcionista simpática. "
@@ -337,6 +340,12 @@ async def log_call(ctx: JobContext) -> None:
         await save_call(call, report.to_dict(), minutes)
     finally:
         await call.db.close()
+    # The session records both sides to a temp dir that is deleted with the job. Keep a copy,
+    # with the moment it started, so demo.py can line the transcript up with the audio.
+    if report.audio_recording_path and report.audio_recording_path.exists():
+        RECORDINGS.mkdir(exist_ok=True)
+        shutil.copy(report.audio_recording_path, RECORDINGS / f"{call.call_id}.ogg")
+        (RECORDINGS / f"{call.call_id}.json").write_text(json.dumps({"started_at": report.audio_recording_started_at}))
 
 
 @server.rtc_session(agent_name="vet-agent", on_session_end=log_call)

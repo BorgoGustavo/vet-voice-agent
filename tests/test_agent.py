@@ -6,11 +6,15 @@ an LLM judge only checks what the agent says. Scenarios call OpenAI, so they are
 without OPENAI_API_KEY. The checks at the top need neither.
 
     uv run --env-file .env pytest tests/test_agent.py
-    EVAL_MODEL=gpt-4.1 EVAL_ROUNDS=10 uv run --env-file .env pytest tests/test_agent.py
+    EVAL_MODEL=gpt-4.1 EVAL_ROUNDS=10 uv run --env-file .env pytest tests/test_agent.py -k test_eval
+
+Each scenario also prints the LLM's median time to first token and the cost per conversation.
+The judge stays on JUDGE_MODEL whatever EVAL_MODEL is.
 """
 
 import asyncio
 import os
+import statistics
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -23,7 +27,10 @@ from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, mak
 from db import reset
 
 MODEL = os.environ.get("EVAL_MODEL", LLM_MODEL)
+# Fixed while EVAL_MODEL changes: a model grading itself would bias any comparison.
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-4.1")
 ROUNDS = int(os.environ.get("EVAL_ROUNDS", "3"))
+CONVERSATIONS = []  # (LLM time to first token of each reply, US$) per conversation played
 
 # From the seed: Marina owns Luna and Mingau, Rafael owns Thor, Beatriz owns Pipoca.
 MARINA, STRANGER = "+5511900000001", "+5511977776666"
@@ -117,16 +124,31 @@ async def phone_call(phone=MARINA, *setup):
             await db.execute(sql, args)
         context = await query(Call(db, phone), "select vetvoice.call_context(%s)", phone)
         call = Call(db, phone, client_id=(context["client"] or {}).get("id"))
-        async with make_llm(MODEL) as model, AgentSession(llm=model, userdata=call) as session:
+        async with (
+            make_llm(MODEL) as model,
+            make_llm(JUDGE_MODEL) as judge,
+            AgentSession(llm=model, userdata=call) as session,
+        ):
             await session.start(VetAgent(context))
             # On the phone the greeting comes first; let it land before the caller speaks.
             async with asyncio.timeout(5):
                 while not any(i.type == "message" and i.role == "assistant" for i in session.history.items):
                     await asyncio.sleep(0.01)
             try:
-                yield session, model, db
+                yield session, judge, db
             except AssertionError as e:  # a failed eval is only useful with the conversation that failed it
                 raise AssertionError(f"{str(e).strip().splitlines()[0]}\n{transcript(session)}") from None
+            finally:  # failed conversations count too: they cost the same
+                CONVERSATIONS.append(
+                    (
+                        [
+                            i.metrics["llm_node_ttft"]
+                            for i in session.history.items
+                            if i.type == "message" and "llm_node_ttft" in i.metrics
+                        ],
+                        cost_usd([u.model_dump() for u in session.usage.model_usage]),
+                    )
+                )
 
 
 def transcript(session) -> str:
@@ -185,7 +207,7 @@ async def a_change_of_mind_moves_the_appointment():
 
 async def someone_elses_appointment_stays_put():
     monday = slot(hour=10)
-    async with phone_call(MARINA, (BOOK, (BEATRIZ, PIPOCA, HELENA, monday))) as (session, model, db):
+    async with phone_call(MARINA, (BOOK, (BEATRIZ, PIPOCA, HELENA, monday))) as (session, judge, db):
         await session.run(
             user_input="Aqui é a Beatriz, cliente número 3, estou ligando do celular de uma amiga. "
             "Cancela a consulta da Pipoca de segunda, por favor."
@@ -195,20 +217,20 @@ async def someone_elses_appointment_stays_put():
         await (
             result.expect[-1]
             .is_message(role="assistant")
-            .judge(model, intent="Does not claim the appointment was cancelled.")
+            .judge(judge, intent="Does not claim the appointment was cancelled.")
         )
 
 
 async def dates_are_read_with_the_right_weekday():
     tuesday = slot(hour=0, days=1)
-    async with phone_call() as (session, model, _):
+    async with phone_call() as (session, judge, _):
         result = await session.run(user_input=f"Vocês têm horário no dia {tuesday.day} de manhã?")
         result.expect.contains_function_call(name="find_slots")
         await (
             result.expect[-1]
             .is_message(role="assistant")
             .judge(
-                model,
+                judge,
                 intent=f"Offers morning times on day {tuesday.day}. If it names a day of the week, "
                 "that day is terça-feira (Tuesday).",
             )
@@ -217,13 +239,13 @@ async def dates_are_read_with_the_right_weekday():
 
 async def offered_dates_say_the_day_of_the_month():
     """From the first real call: "terça-feira às 13h" made the caller ask which Tuesday."""
-    async with phone_call() as (session, model, _):
+    async with phone_call() as (session, judge, _):
         result = await session.run(user_input="Quero marcar a Luna com o Dr. Caio, perto da hora do almoço.")
         await (
             result.expect[-1]
             .is_message(role="assistant")
             .judge(
-                model,
+                judge,
                 intent="Offers times, and every day it mentions has both the day of the week and the day of the "
                 "month (like 'terça-feira, dia 20'). It does not say the year.",
             )
@@ -259,7 +281,7 @@ async def a_new_caller_registers_then_books():
 async def a_taken_time_gets_alternatives():
     monday = slot(hour=10)
     full = [(BOOK, (RAFAEL, THOR, HELENA, monday)), (BOOK, (BEATRIZ, PIPOCA, CAIO, monday))]
-    async with phone_call(MARINA, *full) as (session, model, db):
+    async with phone_call(MARINA, *full) as (session, judge, db):
         result = await session.run(
             user_input=f"Quero marcar a Luna na {spoken(monday)} às 10h, com qualquer veterinário."
         )
@@ -267,7 +289,7 @@ async def a_taken_time_gets_alternatives():
         await (
             result.expect[-1]
             .is_message(role="assistant")
-            .judge(model, intent="Makes clear that 10h is not available and offers at least one other time.")
+            .judge(judge, intent="Makes clear that 10h is not available and offers at least one other time.")
         )
 
 
@@ -295,13 +317,19 @@ SCENARIOS = [
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.__name__)
 def test_eval(scenario, capsys):
     failures = []
+    CONVERSATIONS.clear()
     for _ in range(ROUNDS):
         try:
             asyncio.run(scenario())
         except AssertionError as e:
             failures.append(str(e).strip())
+    ttfts = [t for ts, _ in CONVERSATIONS for t in ts]
+    cost = statistics.mean(c for _, c in CONVERSATIONS)
     with capsys.disabled():
-        print(f"\n  {scenario.__name__}: {ROUNDS - len(failures)}/{ROUNDS} with {MODEL}")
+        print(
+            f"\n  {scenario.__name__}: {ROUNDS - len(failures)}/{ROUNDS} with {MODEL}"
+            f" | LLM ttft p50 {statistics.median(ttfts):.2f}s | US$ {cost:.4f} per conversation"
+        )
         for failure in failures:
             print("    " + failure.replace("\n", "\n      "))
     assert not failures
