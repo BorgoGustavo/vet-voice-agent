@@ -17,10 +17,9 @@ from datetime import datetime
 import psycopg
 import pytest
 from livekit.agents import AgentSession, ToolError, llm, mock_tools
-from livekit.plugins import openai
 from test_booking import DSN, slot
 
-from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, query
+from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, make_llm, query
 from db import reset
 
 MODEL = os.environ.get("EVAL_MODEL", LLM_MODEL)
@@ -89,9 +88,28 @@ async def phone_call(phone=MARINA, *setup):
             await db.execute(sql, args)
         context = await query(Call(db, phone), "select vetvoice.call_context(%s)", phone)
         call = Call(db, phone, client_id=(context["client"] or {}).get("id"))
-        async with openai.LLM(model=MODEL) as model, AgentSession(llm=model, userdata=call) as session:
+        async with make_llm(MODEL) as model, AgentSession(llm=model, userdata=call) as session:
             await session.start(VetAgent(context))
-            yield session, model, db
+            # On the phone the greeting comes first; let it land before the caller speaks.
+            async with asyncio.timeout(5):
+                while not any(i.type == "message" and i.role == "assistant" for i in session.history.items):
+                    await asyncio.sleep(0.01)
+            try:
+                yield session, model, db
+            except AssertionError as e:  # a failed eval is only useful with the conversation that failed it
+                raise AssertionError(f"{str(e).strip().splitlines()[0]}\n{transcript(session)}") from None
+
+
+def transcript(session) -> str:
+    lines = []
+    for item in session.history.items:
+        if item.type == "message" and item.role in ("user", "assistant"):
+            lines.append(f"{item.role}: {item.text_content}")
+        elif item.type == "function_call":
+            lines.append(f"  -> {item.name}({item.arguments})")
+        elif item.type == "function_call_output":
+            lines.append(f"  <- {item.output[:300]}")
+    return "\n".join(lines)
 
 
 async def bookings(db, pet_id):
@@ -205,7 +223,7 @@ async def a_taken_time_gets_alternatives():
         await (
             result.expect[-1]
             .is_message(role="assistant")
-            .judge(model, intent="Says 10h is not available and offers other times.")
+            .judge(model, intent="Makes clear that 10h is not available and offers at least one other time.")
         )
 
 
@@ -236,9 +254,9 @@ def test_eval(scenario, capsys):
         try:
             asyncio.run(scenario())
         except AssertionError as e:
-            failures.append(str(e).strip().splitlines()[0])
+            failures.append(str(e).strip())
     with capsys.disabled():
         print(f"\n  {scenario.__name__}: {ROUNDS - len(failures)}/{ROUNDS} with {MODEL}")
         for failure in failures:
-            print(f"    {failure}")
+            print("    " + failure.replace("\n", "\n      "))
     assert not failures

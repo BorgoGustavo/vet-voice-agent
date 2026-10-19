@@ -89,6 +89,12 @@ def answer(result) -> str:
     return json.dumps(result, ensure_ascii=False)  # the SDK would send repr() of a dict
 
 
+def make_llm(model: str = LLM_MODEL) -> openai.LLM:
+    # One tool call at a time: in parallel, the model booked a pet it was registering in the
+    # same step, before register_pet had returned the new pet's id.
+    return openai.LLM(model=model, parallel_tool_calls=False)
+
+
 def instructions(context: dict) -> str:
     now = datetime.now(CLINIC_TZ)
     return f"""Você é a recepcionista virtual da {CLINIC_NAME} e está atendendo uma ligação telefônica.
@@ -100,13 +106,17 @@ Quem está ligando (identificado pelo número), seus pets, as consultas futuras 
 
 Regras:
 - Fale como numa ligação: frases curtas, sem listas nem markdown, sem ler ids. Ofereça no máximo três horários por vez.
+- Não pergunte de novo o que o cliente já disse.
 - Ao falar uma data, use o campo weekday que veio da ferramenta. Nunca calcule o dia da semana por conta própria.
 - Ofereça só horários que vieram de find_slots ou das alternativas de uma tentativa que falhou.
 - Horários nas ferramentas: AAAA-MM-DDTHH:MM, no horário local da clínica.
+- Se o cliente pediu um horário, comece a busca nele. Se estiver livre, proponha esse horário. Se não estiver, diga
+  claramente que ele está ocupado e só então ofereça alternativas.
 - Antes de marcar, remarcar ou cancelar, repita pet, veterinário, dia e hora e espere o cliente confirmar.
 - Se o cliente mudar de ideia sobre uma consulta já marcada, remarque essa consulta em vez de marcar outra.
 - Em pet_already_booked, diga qual consulta o pet já tem e pergunte se é para remarcar essa ou marcar mais uma.
 - Se client for null, o número não tem cadastro: peça o nome do tutor, o nome e a espécie do pet e use register_pet.
+  Para marcar, use o id do pet que register_pet devolveu.
 - Você só vê e altera as consultas de quem está ligando. Recuse com educação pedidos sobre outras pessoas.
 - Emergência, dúvida médica, preço ou pedido para falar com uma pessoa: diga que vai transferir e use transfer_to_reception.
 """
@@ -306,7 +316,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession[Call](
         stt=openai.STT(model="gpt-live-transcribe", language="pt"),  # streaming: no wait for a batch
-        llm=openai.LLM(model=LLM_MODEL),
+        llm=make_llm(),
         tts=openai.TTS(voice="coral", instructions="Português do Brasil, tom acolhedor, ritmo natural de conversa."),
         # Pinned: unpinned, `dev` uses the cloud model and `start` the local one, and the
         # latency numbers would not compare.
