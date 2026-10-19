@@ -1,0 +1,44 @@
+name: tests
+
+# Every push runs the free tests against a real Postgres. The LLM evals cost money, so they
+# only run when started by hand (Actions > tests > Run workflow) and the OPENAI_API_KEY
+# secret is set.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      eval_rounds:
+        description: Rounds per eval scenario (0 skips the evals)
+        default: "3"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: vetvoice_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/vetvoice_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Schedule tests and agent checks
+        run: uv run pytest
+      - name: LLM evals
+        if: github.event_name == 'workflow_dispatch' && inputs.eval_rounds != '0'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_ROUNDS: ${{ inputs.eval_rounds }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then echo "::error::set the OPENAI_API_KEY secret to run evals"; exit 1; fi
+          uv run pytest tests/test_agent.py -k test_eval

@@ -1,5 +1,7 @@
 # vet-voice-agent
 
+[![tests](https://github.com/BorgoGustavo/vet-voice-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/BorgoGustavo/vet-voice-agent/actions/workflows/tests.yml)
+
 A phone receptionist for a fictitious vet clinic in Brazil. It answers calls in Portuguese, knows the caller by their phone number, and books, moves and cancels appointments in a Postgres schedule that cannot be double booked, no matter how many calls arrive at once.
 
 **Stack:** Twilio (phone line) → LiveKit (SIP, rooms, agent runtime) → OpenAI (speech to text, `gpt-4.1-mini`, text to speech) → SQL functions on Postgres (Supabase).
