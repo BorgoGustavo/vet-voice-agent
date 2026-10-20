@@ -392,6 +392,10 @@ async def entrypoint(ctx: JobContext) -> None:
             # the turn closed 0.3 s into a pause. The final transcript takes ~0.9 s anyway, so
             # waiting 0.6 s costs little latency and keeps a sentence in one turn.
             "endpointing": {"min_delay": 0.6},
+            # Only words interrupt. When LiveKit's adaptive detector timed out (408) the session
+            # fell back to raw VAD, a sound with no words cancelled the reply being generated
+            # after a tool call, and with no transcript to answer the agent went silent.
+            "interruption": {"min_words": 1},
         },
         userdata=call,
     )
