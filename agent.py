@@ -104,13 +104,13 @@ def make_llm(model: str = LLM_MODEL) -> openai.LLM:
 
 
 def instructions(context: dict) -> str:
+    # Fixed text first, per-call text last. OpenAI only caches an identical prefix of at least
+    # 1024 tokens, and the rules are about 560, so calls share no cache yet (measured: zero
+    # cached tokens across callers in either order). Within a call the prompt never changes
+    # and ~78% of input tokens are cached. This order starts paying once the rules grow.
     now = datetime.now(CLINIC_TZ)
     return f"""Você é a recepcionista virtual da {CLINIC_NAME} e está atendendo uma ligação telefônica.
-Hoje é {WEEKDAYS[now.weekday()]}, {now:%d/%m/%Y}, {now:%H:%M}.
 A clínica atende de segunda a sexta das 8h às 18h e sábado das 8h às 12h. Consultas de 30 minutos, até 60 dias à frente.
-
-Quem está ligando (identificado pelo número), seus pets, as consultas futuras e os veterinários:
-{json.dumps(context, ensure_ascii=False)}
 
 Regras:
 - Fale como numa ligação: frases curtas, sem listas nem markdown, sem ler ids.
@@ -130,6 +130,10 @@ Regras:
   que register_pet devolveu.
 - Você só vê e altera as consultas de quem está ligando. Recuse com educação pedidos sobre outras pessoas.
 - Emergência, dúvida médica, preço ou pedido para falar com uma pessoa: diga que vai transferir e use transfer_to_reception.
+
+Agora é {WEEKDAYS[now.weekday()]}, {now:%d/%m/%Y}, {now:%H:%M}.
+Quem está ligando (identificado pelo número), seus pets, as consultas futuras e os veterinários:
+{json.dumps(context, ensure_ascii=False)}
 """
 
 
