@@ -357,7 +357,12 @@ async def entrypoint(ctx: JobContext) -> None:
     # autocommit: each SQL function is its own transaction. Without it the booking and
     # the lock on the pet stay open until the call ends, and a hang-up rolls them back.
     db, caller = await asyncio.gather(
-        psycopg.AsyncConnection.connect(os.environ["DATABASE_URL"], autocommit=True),
+        # One of the pooler's three addresses was unreachable from the test network, psycopg
+        # always tried it first, and with no timeout the caller heard 76 s of silence (the OS
+        # TCP timeout). Shuffled order and a 2 s cap per address: median 0.9 s, worst 3 s.
+        psycopg.AsyncConnection.connect(
+            os.environ["DATABASE_URL"], autocommit=True, connect_timeout=2, load_balance_hosts="random"
+        ),
         ctx.wait_for_participant(),
     )
     logger.info("caller attributes: %s", caller.attributes)  # which keys Twilio sends
