@@ -1,0 +1,45 @@
+name: latency probe
+
+# Every hour for one week: how fast the models answer at each hour of the day, measured from
+# a US datacenter like a deployed agent would be. Each run appends one line to latency.jsonl
+# on the latency-data branch (code stays on main, data stays there).
+on:
+  schedule:
+    - cron: "17 * * * *"  # off the top of the hour, when GitHub's scheduler is busiest
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: latency-probe
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: latency-data
+          path: data
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Measure
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROBE_WHERE: github-actions
+        run: |
+          if [ "$(date -u +%F)" \> 2026-10-26 ]; then echo "the measurement week is over"; exit 0; fi
+          uv run probe.py >> data/latency.jsonl
+      - name: Append to the latency-data branch
+        working-directory: data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latency.jsonl
+          git diff --cached --quiet && exit 0
+          git commit -q -m "probe $(date -u +%FT%H:%MZ)"
+          git push -q

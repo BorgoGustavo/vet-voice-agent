@@ -1,10 +1,11 @@
 name: tests
 
-# Every push runs the free tests against a real Postgres. The LLM evals cost money, so they
-# only run when started by hand (Actions > tests > Run workflow) and the OPENAI_API_KEY
-# secret is set.
+# Every push to main runs the free tests against a real Postgres (latency-data holds no code).
+# The LLM evals cost money, so they only run when started by hand (Actions > tests > Run
+# workflow) and the OPENAI_API_KEY secret is set.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
