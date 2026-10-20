@@ -15,15 +15,37 @@ The judge stays on JUDGE_MODEL whatever EVAL_MODEL is.
 import asyncio
 import os
 import statistics
+import struct
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 import psycopg
 import pytest
-from livekit.agents import AgentSession, ToolError, llm, mock_tools
+from livekit.agents import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    AgentSession,
+    APIConnectionError,
+    APIConnectOptions,
+    ToolError,
+    llm,
+    mock_tools,
+    tts,
+)
 from test_booking import DSN, slot
 
-from agent import LLM_MODEL, WEEKDAYS, Call, VetAgent, cost_usd, local_time, make_llm, query, save_call
+from agent import (
+    LLM_MODEL,
+    WEEKDAYS,
+    Call,
+    HedgedTTS,
+    VetAgent,
+    cost_usd,
+    local_time,
+    make_llm,
+    query,
+    save_call,
+)
 from db import reset
 
 MODEL = os.environ.get("EVAL_MODEL", LLM_MODEL)
@@ -76,6 +98,65 @@ def test_cost_counts_cached_tokens_and_audio_minutes():
         {"model": "silero", "total_requests": 40},
     ]
     assert cost_usd(usage) == pytest.approx((2_000 * 0.40 + 8_000 * 0.10 + 500 * 1.60) / 1e6 + 2 * 0.017)
+
+
+def test_tts_1_is_billed_per_character():
+    assert cost_usd([{"model": "tts-1", "characters_count": 1_000}]) == pytest.approx(1_000 * 15.00 / 1e6)
+
+
+class FakeTTS(tts.TTS):
+    """One 100 ms frame at a constant `level` after `delay` seconds, or a failure."""
+
+    def __init__(self, delay, level, fail=False):
+        super().__init__(capabilities=tts.TTSCapabilities(streaming=False), sample_rate=24_000, num_channels=1)
+        self.delay, self.level, self.fail, self.calls = delay, level, fail, 0
+
+    def synthesize(self, text, *, conn_options=DEFAULT_API_CONNECT_OPTIONS):
+        self.calls += 1
+        return FakeSpeech(tts=self, input_text=text, conn_options=conn_options)
+
+
+class FakeSpeech(tts.ChunkedStream):
+    async def _run(self, output_emitter):
+        output_emitter.initialize(request_id="fake", sample_rate=24_000, num_channels=1, mime_type="audio/pcm")
+        await asyncio.sleep(self._tts.delay)
+        if self._tts.fail:
+            raise APIConnectionError("voice down")
+        output_emitter.push(struct.pack("<h", self._tts.level) * 2_400)
+        output_emitter.flush()
+
+
+def speak(primary, backup):
+    """(level of the audio played, seconds until it was ready), hedging after 0.2 s."""
+
+    async def run():
+        hedged = HedgedTTS(primary, backup, hedge_after=0.2)
+        started = time.perf_counter()
+        frame = await hedged.synthesize("oi", conn_options=APIConnectOptions(max_retry=0)).collect()
+        return frame.data[0], time.perf_counter() - started
+
+    return asyncio.run(run())
+
+
+def test_a_quick_voice_is_played_and_the_backup_never_asked():
+    primary, backup = FakeTTS(0.05, level=1), FakeTTS(0.05, level=2)
+    level, _ = speak(primary, backup)
+    assert (level, backup.calls) == (1, 0)
+
+
+def test_a_stuck_voice_is_replaced_by_the_backup():
+    level, seconds = speak(FakeTTS(30, level=1), FakeTTS(0.05, level=2))
+    assert level == 2 and seconds < 1  # not the 30 s the primary would have taken
+
+
+def test_a_failing_voice_asks_the_backup_at_once():
+    level, seconds = speak(FakeTTS(0.01, level=1, fail=True), FakeTTS(0.05, level=2))
+    assert level == 2 and seconds < 0.2  # without waiting for the hedge delay
+
+
+def test_when_both_voices_fail_the_error_surfaces():
+    with pytest.raises(APIConnectionError):
+        speak(FakeTTS(0.01, level=1, fail=True), FakeTTS(0.01, level=2, fail=True))
 
 
 def test_live_transcription_is_billed_for_the_whole_session():

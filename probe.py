@@ -6,10 +6,13 @@ An hourly GitHub Actions schedule runs it and appends the line to the latency-da
 Variants are interleaved, so both sides of each comparison see the same moment:
 - LLM time to first token, standard vs Fast mode (service_tier=priority), with the agent's
   real prompt and tools and a request that makes it call a tool, as on a real turn;
-- TTS time to first audio, gpt-4o-mini-tts (the agent's voice) vs tts-1.
+- TTS time to first audio, gpt-4o-mini-tts (the agent's voice) vs tts-1, and the agent's
+  actual hedged voice (make_tts): what a caller would hear. Its first frame is 200 ms of
+  audio, so it reads a little later than a raw first byte.
 A failed request is recorded, not raised: an outage is data too.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -18,7 +21,7 @@ from datetime import UTC, datetime
 from livekit.agents import llm
 from openai import OpenAI
 
-from agent import LLM_MODEL, TTS_INSTRUCTIONS, TTS_VOICE, VetAgent, instructions
+from agent import LLM_MODEL, TTS_INSTRUCTIONS, TTS_VOICE, VetAgent, instructions, make_tts
 
 SAMPLES = 5
 CONTEXT = {
@@ -62,7 +65,27 @@ def tts_first_audio(model):
             return time.perf_counter() - start
 
 
+async def hedged_first_audio(voice):
+    start = time.perf_counter()
+    stream = voice.synthesize(SPOKEN)
+    try:
+        await anext(stream)
+        return time.perf_counter() - start
+    finally:
+        await stream.aclose()
+
+
 def main():
+    with asyncio.Runner() as runner:
+        voice = runner.run(_make_voice())
+        measure_all(runner, voice)
+
+
+async def _make_voice():
+    return make_tts()  # built inside the loop its HTTP clients will use
+
+
+def measure_all(runner, voice):
     prompt = instructions(CONTEXT)
     tools = [llm.utils.build_legacy_openai_schema(t) for t in VetAgent(CONTEXT).tools if not isinstance(t, llm.Toolset)]
     variants = {
@@ -70,6 +93,7 @@ def main():
         "llm_fast": lambda: llm_first_token("priority", prompt, tools),
         "tts_gpt-4o-mini-tts": lambda: (tts_first_audio("gpt-4o-mini-tts"), None),
         "tts_tts-1": lambda: (tts_first_audio("tts-1"), None),
+        "tts_hedged": lambda: (runner.run(asyncio.wait_for(hedged_first_audio(voice), 30)), None),
     }
     seconds = {name: [] for name in variants}
     served, errors = {}, {}
