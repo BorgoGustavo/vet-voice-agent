@@ -33,7 +33,7 @@ flowchart LR
 |---|---|
 | Speech to text | `gpt-live-transcribe`, streaming, Portuguese |
 | LLM | `gpt-4.1-mini`, one tool call at a time |
-| Text to speech | `gpt-4o-mini-tts`, voice `nova`, raw PCM |
+| Text to speech | `gpt-4o-mini-tts`, voice `nova`, raw PCM, with `tts-1` as a [hedged backup](#staying-responsive-when-the-providers-are-slow) |
 | Voice activity, end of turn | Silero VAD and LiveKit's turn detector, both local |
 | Noise | Krisp on the SIP trunk |
 
@@ -109,6 +109,30 @@ Measured from the moment the caller stops talking until the agent's first audio.
 
 The total exceeds the sum of the stages on turns that call a tool, because those make two LLM requests. The worker ran on a laptop in Brazil while the models run in the US. A natural conversation sits nearer 1 s. The levers not pulled yet are listed under [Not done yet](#not-done-yet).
 
+### Staying responsive when the providers are slow
+
+The first attempts to record a demo, at midday in Brazil, went silent: 76 s before the greeting, then a reply that never came. A caller hangs up long before that. Each silence had its own cause.
+
+| Silence | Cause | Fix |
+|---|---|---|
+| 76 s before the greeting | One of the database pooler's three addresses never answered from the test network. The driver tried it first every time and waited for the operating system's TCP timeout. | A 2 s cap per address and a shuffled order. Over 12 connections: median 0.9 s, worst 3 s. |
+| No answer after a tool call | LiveKit's interruption detector timed out and the session fell back to plain voice activity detection. A noise counted as an interruption and cancelled the reply, and with no words there was nothing left to answer. | Only words interrupt (`min_words=1`). A spoken "não" still cuts the agent off. The cause comes from the log and the SDK code; it was not reproduced on demand. |
+| Silence in the middle of a call | The voice model sometimes takes 10 s, 54 s or more than 30 s to start. The OpenAI plugin waits up to 30 s per attempt, for three attempts. | A hedged request, below. |
+
+**The voice stalls, so a second voice stands by.** If `gpt-4o-mini-tts` has not produced audio 1.5 s after a sentence is sent, or has failed, the same sentence also goes to `tts-1`, and whichever speaks first is played. This is the hedged request from Dean and Barroso's "The Tail at Scale". `tts-1` is slower to start but has never stalled. The extra request is paid only on slow sentences. A rescued sentence can sound slightly different, since `tts-1` takes no tone instructions.
+
+[`probe.py`](probe.py) measures it from a US datacenter on a GitHub Actions schedule, with the agent's real prompt, tools and voice. Time to first audio over the first 6 runs, 20 and 21 October:
+
+| Voice | Requests | Stalled past 30 s | p50 | Worst |
+|---|---|---|---|---|
+| `gpt-4o-mini-tts` alone | 30 | **4** | 0.58 s | over 30 s |
+| `tts-1` alone | 30 | 0 | 1.87 s | 4.26 s |
+| **Hedged**, what the caller hears | 25 | **0** | 0.78 s | 2.44 s |
+
+The hedged voice joined the probe after its first run. All four stalls came during Brazilian business hours, which is when a clinic gets its calls.
+
+The same probe compares the LLM's standard and Fast mode (priority processing, 1.75 times the price). The time to first token was p50 1.02 s against 0.80 s, and p95 2.56 s against 1.68 s. The probe runs until 26 October. Whether Fast mode is worth its price, and how latency moves with the time of day, waits for that week of data, which lands on the [`latency-data`](https://github.com/BorgoGustavo/vet-voice-agent/tree/latency-data) branch.
+
 ### Cost
 
 A 4.4 minute conversation costs about **US$ 0.13 in model usage**, about US$ 0.03 a minute. Telephony is not included.
@@ -147,7 +171,7 @@ A 4.4 minute conversation costs about **US$ 0.13 in model usage**, about US$ 0.0
 | Layer | What it covers | Cost | Command |
 |---|---|---|---|
 | `tests/test_booking.py`, 38 tests | schedule rules, races, time zones, ownership | free, 3 s | `uv run pytest` |
-| `tests/test_agent.py`, 8 checks | the contract between model and code: tool schemas, time parsing, cost, the Python to SQL seam | free | `uv run pytest` |
+| `tests/test_agent.py`, 13 checks | the contract between model and code: tool schemas, time parsing, cost, the Python to SQL seam, the hedged voice | free | `uv run pytest` |
 | `tests/test_agent.py`, 8 evals | conversations with the real model, tools and database | cents | `uv run --env-file .env pytest tests/test_agent.py` |
 | Real conversations | what text cannot show: transcription, turn taking, voice, latency | cents a minute | `dial.py` |
 
@@ -167,7 +191,7 @@ You need Python 3.13 with [uv](https://docs.astral.sh/uv/), and a local Postgres
 
 ```bash
 uv sync
-uv run pytest                                    # 46 tests; the evals skip without OPENAI_API_KEY
+uv run pytest                                    # 59 tests; the 8 evals skip without OPENAI_API_KEY
 
 cp .env.example .env                             # then fill it in
 uv run --env-file .env pytest tests/test_agent.py               # evals
@@ -216,6 +240,7 @@ For a real clinic:
 | [`agent.py`](agent.py) | the voice agent: pipeline, prompt, tools, call logging |
 | [`dial.py`](dial.py) | make the agent call a phone, or open a browser session as a caller |
 | [`db.py`](db.py) | apply the migration and the seed |
+| [`probe.py`](probe.py) | measure model latency now; a GitHub Actions schedule runs it |
 | [`supabase/migrations/0001_schema.sql`](supabase/migrations/0001_schema.sql) | the schedule: tables, constraints and every function the agent calls |
 | [`supabase/seed.sql`](supabase/seed.sql) | two vets, three clients, four pets, all invented |
 | [`tests/`](tests) | schedule tests and agent evals |
