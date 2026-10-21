@@ -175,7 +175,7 @@ A 4.4 minute conversation costs about **US$ 0.13 in model usage**, about US$ 0.0
 
 **Repeating a request is harmless.** Booking, cancelling and registering return the same answer the second time, so a retried or repeated tool call never books twice.
 
-**Every call is a row.** Each call stores its transcript with per-turn latency, model usage, cost and outcome. The latency table above came straight from it.
+**Every call is a row, and a trace.** Each call stores its transcript with per-turn latency, model usage, cost and outcome. The latency table above came straight from it. With Langfuse keys in `.env`, the call is also an OpenTelemetry trace in [Langfuse](https://langfuse.com): a span for each turn, LLM request, tool call and voice request, with timings and tokens. LiveKit's SDK emits the spans; [`agent.py`](agent.py) only points them at Langfuse.
 
 ## Threat model
 
@@ -192,7 +192,7 @@ Anyone can dial the number and say anything. What a caller can reach is set by w
 Not covered:
 - **Spoofed caller ID.** The phone number is the only identity, and it can be faked. Changes would need a second factor, such as the pet's name.
 - **Cost abuse.** The agent answers anyone, and nothing limits call length or calls per number.
-- **Personal data.** Transcripts and recordings hold names and phone numbers, and need a retention policy and redaction under Brazil's LGPD.
+- **Personal data.** Transcripts, recordings and traces hold names and phone numbers, and need a retention policy and redaction under Brazil's LGPD.
 
 ## How it is tested
 

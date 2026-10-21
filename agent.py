@@ -15,6 +15,7 @@ This file wires a call together. The parts:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -23,7 +24,11 @@ from pathlib import Path
 
 import psycopg
 from livekit.agents import AgentServer, AgentSession, JobContext, cli, inference
+from livekit.agents.telemetry import set_tracer_provider
 from livekit.plugins import openai
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from psycopg.types.json import Jsonb
 
 from billing import cost_usd
@@ -40,6 +45,22 @@ def make_llm(model: str = LLM_MODEL) -> openai.LLM:
     # One tool call at a time: in parallel, the model booked a pet it was registering in the
     # same step, before register_pet had returned the new pet's id.
     return openai.LLM(model=model, parallel_tool_calls=False)
+
+
+def trace_to_langfuse(session_id: str) -> TracerProvider | None:
+    """Sends the call's OpenTelemetry spans (turns, LLM, tools, voice) to Langfuse, when its
+    keys are set. The spans carry transcripts and the caller's number (allow_pii)."""
+    if not os.environ.get("LANGFUSE_PUBLIC_KEY"):
+        return None
+    keys = f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}"
+    exporter = OTLPSpanExporter(
+        endpoint=f"{os.environ['LANGFUSE_BASE_URL'].rstrip('/')}/api/public/otel/v1/traces",
+        headers={"Authorization": f"Basic {base64.b64encode(keys.encode()).decode()}"},
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    set_tracer_provider(provider, metadata={"langfuse.session.id": session_id})
+    return provider
 
 
 server = AgentServer()
@@ -80,6 +101,12 @@ async def log_call(ctx: JobContext) -> None:
 
 @server.rtc_session(agent_name="vet-agent", on_session_end=log_call)
 async def entrypoint(ctx: JobContext) -> None:
+    if tracing := trace_to_langfuse(ctx.room.name):  # each call runs in its own process
+
+        async def flush() -> None:
+            tracing.force_flush()
+
+        ctx.add_shutdown_callback(flush)
     # autocommit: each SQL function is its own transaction. Without it the booking and
     # the lock on the pet stay open until the call ends, and a hang-up rolls them back.
     db, caller = await asyncio.gather(
