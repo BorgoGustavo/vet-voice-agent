@@ -6,7 +6,7 @@ A phone receptionist for a fictitious vet clinic in Brazil. It answers calls in 
 
 **Stack:** Twilio (phone line) → LiveKit (SIP, rooms, agent runtime) → OpenAI (speech to text, `gpt-4.1-mini`, text to speech) → SQL functions on Postgres (Supabase).
 
-All clinic data is invented. The schedule rules live in [one migration](supabase/migrations/0001_schema.sql), the agent in [one file](agent.py).
+All clinic data is invented. The schedule rules live in [one migration](supabase/migrations/0001_schema.sql), the agent in [`agent.py`](agent.py) and four small modules next to it.
 
 ## What a call can do
 
@@ -93,7 +93,7 @@ To add a model to the comparison:
 EVAL_MODEL=gpt-4.1-nano EVAL_ROUNDS=10 uv run --env-file .env pytest tests/test_agent.py -k test_eval
 ```
 
-Each scenario prints its pass rate, the median LLM time to first token and the cost per conversation. A new model also needs its price in `PRICES` in `agent.py`.
+Each scenario prints its pass rate, the median LLM time to first token and the cost per conversation. A new model also needs its price in `PRICES` in [`billing.py`](billing.py).
 
 ### Latency: one real conversation, 8 turns
 
@@ -237,7 +237,11 @@ For a real clinic:
 
 | Path | What it is |
 |---|---|
-| [`agent.py`](agent.py) | the voice agent: pipeline, prompt, tools, call logging |
+| [`agent.py`](agent.py) | wires a call together: speech, LLM and voice, the caller's context, the call's report |
+| [`tools.py`](tools.py) | what the LLM can do during a call, one SQL function per tool |
+| [`prompt.py`](prompt.py) | the system prompt |
+| [`voice.py`](voice.py) | text to speech, hedged against a stalled request |
+| [`billing.py`](billing.py) | model prices and the cost of a call |
 | [`dial.py`](dial.py) | make the agent call a phone, or open a browser session as a caller |
 | [`demo.py`](demo.py) | turn a recorded call into a captioned video, with English subtitles |
 | [`db.py`](db.py) | apply the migration and the seed |

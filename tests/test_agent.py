@@ -34,19 +34,12 @@ from livekit.agents import (
 )
 from test_booking import DSN, slot
 
-from agent import (
-    LLM_MODEL,
-    WEEKDAYS,
-    Call,
-    HedgedTTS,
-    VetAgent,
-    cost_usd,
-    local_time,
-    make_llm,
-    query,
-    save_call,
-)
+from agent import LLM_MODEL, make_llm, save_call
+from billing import cost_usd
 from db import reset
+from prompt import WEEKDAYS
+from tools import Call, VetAgent, local_time, query
+from voice import HedgedTTS
 
 MODEL = os.environ.get("EVAL_MODEL", LLM_MODEL)
 # Fixed while EVAL_MODEL changes: a model grading itself would bias any comparison.

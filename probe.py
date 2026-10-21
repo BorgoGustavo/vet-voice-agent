@@ -21,7 +21,10 @@ from datetime import UTC, datetime
 from livekit.agents import llm
 from openai import OpenAI
 
-from agent import LLM_MODEL, TTS_INSTRUCTIONS, TTS_VOICE, VetAgent, instructions, make_tts
+from agent import LLM_MODEL
+from prompt import instructions
+from tools import VetAgent
+from voice import TTS_INSTRUCTIONS, TTS_VOICE, make_tts
 
 SAMPLES = 5
 CONTEXT = {
