@@ -1,0 +1,5 @@
+# Only what the image needs. Everything else, .env and recordings included, stays out.
+*
+!pyproject.toml
+!uv.lock
+!*.py

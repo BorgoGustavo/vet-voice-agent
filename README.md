@@ -36,6 +36,7 @@ flowchart LR
 | Text to speech | `gpt-4o-mini-tts`, voice `nova`, raw PCM, with `tts-1` as a [hedged backup](#staying-responsive-when-the-providers-are-slow) |
 | Voice activity, end of turn | Silero VAD and LiveKit's turn detector, both local |
 | Noise | Krisp on the SIP trunk |
+| Hosting | LiveKit Cloud agents in `us-east`, next to OpenAI and the database ([`Dockerfile`](Dockerfile)) |
 
 ## Numbers
 
@@ -229,6 +230,20 @@ uv run --env-file .env dial.py --browser +5511999999999         # talk to it in 
 uv run --env-file .env dial.py +5511999999999                   # or have it call that phone
 ```
 
+### Deploying to LiveKit Cloud
+
+The [`Dockerfile`](Dockerfile) installs the locked dependencies and runs `agent.py start`. With `LIVEKIT_*` in the environment:
+
+```bash
+uv run --env-file .env -- lk agent create --region us-east --secrets-file <secrets> .   # once
+uv run --env-file .env -- lk agent deploy .                                             # each new version
+uv run --env-file .env -- lk agent logs
+```
+
+`<secrets>` holds `OPENAI_API_KEY`, `DATABASE_URL`, `RECEPTION_NUMBER` and, for tracing, the `LANGFUSE_*` keys. LiveKit injects its own credentials. Two things to know:
+- **A local `agent.py dev` competes with the deployment.** Both register as `vet-agent`, and LiveKit sends each call to either one.
+- **On the free plan the deployment scales to zero** when idle, and the first call after that waits 10 to 20 s for the agent to start.
+
 ### Wiring the phone line (once)
 
 - **Twilio:** an Elastic SIP trunk with:
@@ -248,7 +263,7 @@ The Brazilian mobile carrier used for testing drops calls from US numbers, which
 - **Transfer to reception** is wired (SIP REFER, transfer enabled on the trunk) but not yet verified on a real phone call.
 - **Phone evals:** a second agent that calls the clinic number with a scripted persona, to measure latency over the phone network on every change.
 - **Latency:**
-  - host the worker next to the models;
+  - measure the hosted worker: deployed in `us-east`, not yet measured on a real conversation;
   - try a smaller LLM, if the evals hold;
   - use faster speech vendors;
   - shorten the 2.5 s wait the turn detector uses when it thinks a sentence is unfinished.

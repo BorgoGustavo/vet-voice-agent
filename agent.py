@@ -104,7 +104,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if tracing := trace_to_langfuse(ctx.room.name):  # each call runs in its own process
 
         async def flush() -> None:
-            tracing.force_flush()
+            await asyncio.to_thread(tracing.force_flush)  # a blocking HTTP call, off the event loop
 
         ctx.add_shutdown_callback(flush)
     # autocommit: each SQL function is its own transaction. Without it the booking and
