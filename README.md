@@ -239,6 +239,7 @@ For a real clinic:
 |---|---|
 | [`agent.py`](agent.py) | the voice agent: pipeline, prompt, tools, call logging |
 | [`dial.py`](dial.py) | make the agent call a phone, or open a browser session as a caller |
+| [`demo.py`](demo.py) | turn a recorded call into a captioned video, with English subtitles |
 | [`db.py`](db.py) | apply the migration and the seed |
 | [`probe.py`](probe.py) | measure model latency now; a GitHub Actions schedule runs it |
 | [`supabase/migrations/0001_schema.sql`](supabase/migrations/0001_schema.sql) | the schedule: tables, constraints and every function the agent calls |

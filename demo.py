@@ -94,13 +94,16 @@ def main(call_id):
     recordings = Path(os.environ.get("RECORDINGS_DIR", "recordings"))
     audio = recordings / f"{call_id}.ogg"
     t0 = json.loads((recordings / f"{call_id}.json").read_text())["started_at"]
-    with psycopg.connect(os.environ["DATABASE_URL"]) as db:
-        transcript, cost, started, ended = db.execute(
-            "select transcript, cost_usd, started_at, ended_at from vetvoice.calls where id = %s", (call_id,)
+    with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=2, load_balance_hosts="random") as db:
+        transcript, cost = db.execute(
+            "select transcript, cost_usd from vetvoice.calls where id = %s", (call_id,)
         ).fetchone()
     lines = lines_of(transcript["items"], t0)
     english = translate([text for _, _, _, text, _ in lines])
-    seconds = int((ended - started).total_seconds())
+    # The recording's length, which is what the viewer sees. The call row also counts the
+    # wrap-up after the caller hangs up.
+    probe = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio)]
+    seconds = round(float(subprocess.run(probe, capture_output=True, text=True, check=True).stdout))
     subtitle = f"A real call, recorded by the agent.  {seconds // 60}:{seconds % 60:02d}  |  US$ {cost:.2f} in models"
 
     with tempfile.TemporaryDirectory() as tmp:
